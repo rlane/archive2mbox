@@ -1,0 +1,138 @@
+#!/usr/bin/env ruby
+require 'optparse'
+require 'socket'
+
+OPTIONS = {
+	:server => nil,
+	:newsgroup => nil,
+	:port => 119,
+	:window => 16,
+	:output_filename => nil,
+	:offset => nil,
+	:count => nil,
+}
+
+ARGV.options do |o|
+	script_name = File.basename($0)
+
+	o.set_summary_indent('  ')
+	o.banner = "Usage: #{script_name} server newsgroup [OPTIONS]"
+	o.define_head "Download a newsgroup in mbox format"
+
+	o.on("-o", "--output=filename", String, "Output filename") { |OPTIONS[:output_filename]| }
+	o.on("-p", "--port=val", Integer, "Port", "Default: #{OPTIONS[:port]}") { |OPTIONS[:port]| }
+	o.on("-w", "--window=val", Integer, "Window size", "Default: #{OPTIONS[:window]}") { |OPTIONS[:window]| }
+	o.on("-s", "--start=val", Integer, "Offset") { |OPTIONS[:offset]| }
+	o.on("-c", "--count=val", Integer, "Count") { |OPTIONS[:count]| }
+	o.on("-v", "--verbose", "Run verbosely") { |$VERBOSE| }
+
+	o.separator ""
+
+	o.on_tail("-h", "--help", "Show this help message.") { puts o; exit }
+
+	o.parse!
+end
+
+OPTIONS[:server] = ARGV[0] or raise "server argument required"
+OPTIONS[:newsgroup] = ARGV[1] or raise "newsgroup argument required"
+
+def main opts
+	$stderr.puts "connecting to #{opts[:server]}:#{opts[:port]}" if $VERBOSE
+	socket, low_id, high_id = nntp_connect opts[:server], opts[:port]
+	low_id, high_id = nntp_group socket, opts[:newsgroup], opts[:offset], opts[:count]
+
+	$stderr.puts "downloading #{opts[:newsgroup]} #{low_id}..#{high_id} (window #{opts[:window]})" if $VERBOSE
+	outfile = opts[:output_filename] ? File.open(opts[:output_filename], "w") : $stdout
+	pipeline_articles socket, outfile, low_id, high_id, opts[:window] do |ls|
+		output_article outfile, opts[:newsgroup], ls
+	end
+	outfile.close if opts[:output_filename]
+end
+
+def output_article outfile, newsgroup, ls
+	useful_headers = %w(from subject date message-id references in-reply-to content-type content-transfer-encoding)
+	in_header = true
+	field = nil
+	outfile.puts "From #{newsgroup} #{Time.now.strftime("%a %b %d %H:%M:%S %Y")}"
+	ls.each do |l|
+		if in_header and not l.empty?
+			field, value = l.split(': ', 2) unless l.start_with? "\t"
+			outfile.puts l if useful_headers.member? field.downcase
+		else
+			in_header = false
+			l.gsub!(/^(From )/) { ">" + $1 }
+			outfile.puts l
+		end
+	end
+	outfile.puts
+end
+
+def pipeline_articles socket, outfile, low_id, high_id, window_size
+	cur = low_id
+	inflight = 0
+
+	while inflight < window_size and cur <= high_id
+		nntp_send_article socket, cur
+		cur += 1
+		inflight += 1
+	end
+
+	while cur <= high_id
+		nntp_send_article socket, cur
+		cur += 1
+		ls = nntp_recv_article socket
+		yield ls if ls
+		$stderr.puts "#{cur-low_id}/#{high_id-low_id}" if $VERBOSE and ((cur-low_id) % 100 == 0)
+	end
+
+	while inflight > 0
+		ls = nntp_recv_article socket
+		yield ls if ls
+		inflight -= 1
+	end
+end
+
+def ok_response? resp
+	(200..299).member? resp
+end
+
+def nntp_connect server, port
+	socket = TCPSocket.new server, port
+	l = socket.readline
+	raise "invalid response" unless l =~ /^((\d)\d\d)/
+	raise "NNTP error response #{l.inspect}" unless $2 == '2'
+	socket
+end
+
+def nntp_group socket, newsgroup, offset, count
+	socket.puts "GROUP #{newsgroup}\r\n"
+	l = socket.readline
+	resp, size, low_id, high_id = l.split[0...4].map { |x| x.to_i }
+	raise "NNTP error response #{l.inspect}" unless ok_response? resp
+	low_id = offset >= size ? high_id+1 : [low_id + offset, high_id].min
+	high_id = count ? [low_id + count - 1, high_id].min : high_id
+	[low_id, high_id]
+end
+
+def nntp_send_article socket, article_id
+	socket.puts "ARTICLE #{article_id}\r\n"
+end
+
+def nntp_recv_article socket
+	l = socket.readline
+	resp, article_id = l.split.map { |x| x.to_i }
+
+	if not ok_response? resp
+		$stderr.puts "failed to receive article" if $VERBOSE
+		return nil
+	end
+
+	ls = []
+	while l = socket.readline.chomp
+		break if l == '.'
+		ls << l
+	end
+	return ls
+end
+
+main OPTIONS

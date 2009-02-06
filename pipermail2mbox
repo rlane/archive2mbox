@@ -1,0 +1,58 @@
+#!/usr/bin/env ruby1.8
+require 'date'
+require 'open-uri'
+require 'zlib'
+require 'stringio'
+require 'rubygems'
+require 'mechanize'
+
+OPTIONS = {
+	:base_url => nil,
+	:output_filename => nil,
+}
+
+OPTIONS[:base_url] = ARGV[0] or raise "url required"
+OPTIONS[:output_filename] = ARGV[1] or raise "output filename required"
+
+def main opts
+	File.open opts[:output_filename], "w" do |outfile|
+		each_archive opts[:base_url] do |infile|
+			archive2mbox infile, outfile
+		end
+	end
+end
+
+def get_filenames base_url
+	agent = WWW::Mechanize.new
+	page = agent.get(base_url)
+	page.links.select { |l| l.text =~ /^\[.*Text.*\]$/ }.map { |l| l.href }
+end
+
+def each_archive_filename base_url
+	get_filenames(base_url).each { |fn| yield base_url + fn }
+end
+
+def each_archive base_url
+	each_archive_filename(base_url) do |fn|
+		$stderr.puts "opening #{fn}" if $VERBOSE
+		infile = open fn
+		yield case fn
+		when /txt.gz$/
+			Zlib::GzipReader.new infile
+		when /txt$/
+			infile
+		else
+			raise "unknown file type #{path.inspect}"
+		end
+	end
+end
+
+def archive2mbox infile, outfile
+	msgsep = /^From\s.*\s+\d+:\d+:\d+\s+\d+/
+	infile.each_line do |l|
+		l = ">#{l}" if l =~ /^From / and not l =~ msgsep
+		outfile.write l
+	end
+end
+
+main OPTIONS
